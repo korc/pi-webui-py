@@ -1,0 +1,80 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>pi — web ui</title>
+  <link rel="stylesheet" href="/style.css" />
+</head>
+<body>
+  <div id="app">
+    <header id="topbar">
+      <div class="brand">
+        <span class="brand-mark">π</span>
+        <span class="brand-name">pi</span>
+        <span class="brand-sub">web ui</span>
+      </div>
+      <div class="topbar-right">
+        <span id="status-pill" class="pill pill-idle">
+          <span class="status-dot" id="status-dot"></span>
+          <span id="status-text">connecting…</span>
+        </span>
+        <select id="model-select" title="Model">
+          <option value="">model…</option>
+        </select>
+        <select id="thinking-select" title="Thinking level">
+          <option value="">thinking…</option>
+        </select>
+        <button id="btn-compact" class="icon-btn" title="Compact context">Compact</button>
+        <button id="btn-abort" class="icon-btn danger hidden" title="Abort">Abort</button>
+      </div>
+    </header>
+
+    <div id="statsbar">
+      <div class="stat"><span class="stat-label">Tokens</span><span id="stat-tokens">—</span></div>
+      <div class="stat"><span class="stat-label">Cost</span><span id="stat-cost">—</span></div>
+      <div class="stat"><span class="stat-label">Context</span><span id="stat-context">—</span></div>
+      <div class="stat stat-grow"><span class="stat-label">Session</span><span id="stat-session">—</span></div>
+    </div>
+
+    <main id="messages">
+      <div id="messages-inner">
+        <div class="welcome">
+          <div class="welcome-card">
+            <h1>π web ui</h1>
+            <p>Chat with your pi coding agent. Prompts are sent to <code>pi --mode rpc</code> over a JSONL bridge.</p>
+            <p class="dim">Start a conversation below. The agent can read, write, and run tools in the workspace.</p>
+          </div>
+        </div>
+      </div>
+    </main>
+
+    <div id="queue" class="hidden">
+      <div class="queue-inner">
+        <span class="queue-label">Queued</span>
+        <div id="queue-items" class="queue-items"></div>
+      </div>
+    </div>
+
+    <footer id="composer-wrap">
+      <div id="composer">
+        <textarea id="input" rows="1" placeholder="Message pi…  (Enter to send, Shift+Enter for newline)"></textarea>
+        <button id="send-btn" class="send-btn" title="Send">↑</button>
+      </div>
+      <div id="composer-hint" class="hint">Enter to send · Shift+Enter for newline · pi --mode rpc</div>
+    </footer>
+  </div>
+
+  <div id="dialog-overlay" class="hidden">
+    <div id="dialog-card" class="dialog-card">
+      <div id="dialog-title" class="dialog-title"></div>
+      <div id="dialog-body"></div>
+      <div id="dialog-actions"></div>
+    </div>
+  </div>
+
+  <div id="toasts"></div>
+
+  <script src="/app.js"></script>
+</body>
+</html>
