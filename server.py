@@ -46,6 +46,8 @@ PI_ARGS = ["pi", "--mode", "rpc", "--session-dir", os.environ.get("PI_SESSION_DI
 PI_CWD = os.environ.get("PI_WEB_CWD") or os.getcwd()
 CMD_TIMEOUT = 300
 TOKEN_TTL_SECONDS = int(os.environ.get("PI_WEB_TOKEN_TTL", "300"))
+PI_URL_BASE = (os.environ.get("PI_WEB_URL_BASE") or "").rstrip("/")
+PI_UNIX_SOCKET = os.environ.get("PI_WEB_UNIX_SOCKET") or os.environ.get("PI_UNIX_SOCKET") or ""
 
 
 class Bridge:
@@ -86,6 +88,8 @@ class Bridge:
 
     def _build_token_link(self, host=None):
         if not host:
+            if PI_URL_BASE:
+                return PI_URL_BASE + "/?token=" + self.token
             host = self._outbound_ip() or ("localhost" if (HOST in ("0.0.0.0", "::", "")) else HOST)
         return "http://" + host + ":" + str(PORT) + "/?token=" + self.token
 
@@ -456,8 +460,15 @@ class Handler(BaseHTTPRequestHandler):
         finally:
             BRIDGE.unsubscribe(q)
 
+class UnixThreadingHTTPServer(ThreadingHTTPServer):
+    address_family = socket.AF_UNIX
+
+
 def main():
-    server = ThreadingHTTPServer((HOST, PORT), Handler)
+    if PI_UNIX_SOCKET:
+        server = UnixThreadingHTTPServer(PI_UNIX_SOCKET, Handler)
+    else:
+        server = ThreadingHTTPServer((HOST, PORT), Handler)
     server.daemon_threads = True
     print(f"[pi-webui] serving on http://{HOST}:{PORT} (pi: {' '.join(PI_ARGS)})", flush=True)
     server.serve_forever()
