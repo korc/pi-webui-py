@@ -6,23 +6,23 @@ const $ = (sel) => document.querySelector(sel);
 
 const state = {
   streaming: false,
-  agentAlive: true,
   model: null,
   thinkingLevel: null,
   thinkingLevels: [],
-  steeringMode: 'all',
-  followUpMode: 'one-at-a-time',
   sessionName: null,
-  autoCompactionEnabled: false,
   stats: null,
   queue: { steering: [], followUp: [] },
   items: [],
+  sessions: [],
+  historyMessages: null,
+  historyVisible: 50,
   toolBlocks: new Map(),
   streamingItem: null,
   dialog: null,
   retry: null,
-  compacting: false,
   autoScroll: true,
+  token: null,
+  authGateToken: null,
 };
 
 
@@ -53,6 +53,54 @@ function esc(s) {
     .replace(/</g, '&lt;')
     .replace(/>/g, '&gt;')
     .replace(/"/g, '&quot;');
+}
+
+function formatBytes(b) {
+  if (b == null) return '';
+  const units = ['B', 'KB', 'MB', 'GB'];
+  let v = b;
+  let i = 0;
+  while (v >= 1024 && i < units.length - 1) { v /= 1024; i++; }
+  return v.toFixed(v >= 100 ? 0 : 1) + ' ' + units[i];
+}
+
+const TOKEN_RE = /(?<comment>\/\/[^\n]*|\/\*[\s\S]*?\*\/|#[^\n]*|<!--[\s\S]*?-->)|(?<str>'(?:[^'\\\n]|\\.)*'|"(?:[^"\\\n]|\\.)*"|`(?:[^`\\]|\\.)*`)|(?<num>\b\d+(?:\.\d+)?\b)|(?<fn>[A-Za-z_$][\w$]*(?=\())|(?<tag><\/?[A-Za-z][\w-]*|<!DOCTYPE[^>]*|<\?[\s\S]*?\?>)|(?<word>[A-Za-z_$][\w$]*)/g;
+
+const LANG_KEYWORDS = {
+  bash: ['if','then','else','elif','fi','for','while','do','done','case','esac','in','function','local','return','exit','echo','export','cd','sudo','cat','ls','grep','sed','awk','curl','git','npm','pip','python3','node'],
+  python: ['def','class','import','from','as','return','if','elif','else','for','while','try','except','finally','with','pass','break','continue','lambda','yield','raise','in','not','and','or','True','False','None'],
+  javascript: ['const','let','var','function','return','if','else','for','while','do','switch','case','break','continue','new','class','extends','super','try','catch','finally','throw','typeof','instanceof','of','async','await','yield','import','from','export'],
+  typescript: ['interface','type','implements','public','private','protected','readonly','namespace','declare','abstract','keyof','enum','satisfies'],
+  css: ['important','inherit','initial','unset','media','keyframes','from','to','root','hover','focus','active','none','auto','solid','absolute','relative','fixed','sticky','block','inline','flex','grid','hidden','solid'],
+  json: ['true','false','null'],
+  markdown: [],
+  plaintext: [],
+};
+
+function highlight(code, lang) {
+  code = code == null ? '' : String(code);
+  const key = String(lang || '').toLowerCase().split(/[-_]/)[0];
+  const kws = new Set(LANG_KEYWORDS[key] || LANG_KEYWORDS.plaintext);
+  let out = '';
+  let last = 0;
+  let m;
+  TOKEN_RE.lastIndex = 0;
+  while ((m = TOKEN_RE.exec(code)) !== null) {
+    if (m[0].length === 0) { TOKEN_RE.lastIndex++; continue; }
+    out += esc(code.slice(last, m.index));
+    const g = m.groups || {};
+    let cls = 'tok-plain';
+    if (g.comment) cls = 'tok-com';
+    else if (g.str) cls = 'tok-str';
+    else if (g.num) cls = 'tok-num';
+    else if (g.fn) cls = 'tok-fn';
+    else if (g.tag) cls = 'tok-tag';
+    else if (g.word && kws.has(g.word)) cls = 'tok-kw';
+    out += '<span class="' + cls + '">' + esc(m[0]) + '</span>';
+    last = m.index + m[0].length;
+  }
+  out += esc(code.slice(last));
+  return out;
 }
 
 function mdInline(t) {
@@ -89,7 +137,7 @@ function md(text) {
       if (!inCode) { inCode = true; codeLines.length = 0; codeLang = fence[1] || ''; }
       else {
         inCode = false;
-        out.push('<pre><code' + (codeLang ? ' class="language-' + esc(codeLang) + '"' : '') + '>' + esc(codeLines.join('\n')) + '</code></pre>');
+        out.push('<pre><code' + (codeLang ? ' class="language-' + esc(codeLang) + '"' : '') + '>' + highlight(codeLines.join('\n'), codeLang) + '</code></pre>');
       }
       i++;
       continue;
@@ -129,8 +177,161 @@ function md(text) {
 
 // ================= api =================
 
+async function loadSessions() {
+  try {
+    const data = await api('/api/sessions');
+    if (data.ok) state.sessions = data.data.sessions || [];
+    renderSessions();
+  } catch { /* ignore */ }
+}
+
+function sessionDisplayName(s) {
+  const base = (s.path || '').split('/').pop() || '';
+  return base.replace(/\.jsonl$/, '');
+}
+
+function renderSessions() {
+  const list = $('#session-list');
+  list.innerHTML = '';
+  const sessions = state.sessions || [];
+  if (!sessions.length) {
+    $('#sessions-empty').style.display = 'block';
+    return;
+  }
+  $('#sessions-empty').style.display = 'none';
+  for (const s of sessions) {
+    const div = document.createElement('div');
+    div.className = 'session-item';
+    const nameEl = document.createElement('div');
+    nameEl.className = 'session-name';
+    nameEl.textContent = sessionDisplayName(s);
+    const meta = document.createElement('div');
+    meta.className = 'session-meta';
+    meta.textContent = new Date(s.mtime * 1000).toLocaleString();
+    const dirEl = document.createElement('div');
+    dirEl.className = 'session-meta';
+    dirEl.textContent = s.dir || '';
+    const sizeEl = document.createElement('div');
+    sizeEl.className = 'session-meta';
+    sizeEl.textContent = formatBytes(s.size) + ' · ' + (s.messages || 0) + ' msgs';
+    div.appendChild(nameEl);
+    div.appendChild(meta);
+    div.appendChild(dirEl);
+    div.appendChild(sizeEl);
+    div.addEventListener('click', () => loadSession(s.path));
+    list.appendChild(div);
+  }
+}
+
+async function loadSession(path) {
+  try {
+    const resp = await cmd({ type: 'switch_session', sessionPath: path });
+    if (resp && resp.cancelled) { toast('Session switch was cancelled', 'error'); return; }
+  } catch { toast('Failed to load session', 'error'); return; }
+  state.items = [];
+  state.toolBlocks.clear();
+  state.streamingItem = null;
+  state.queue = { steering: [], followUp: [] };
+  state.historyMessages = [];
+  state.historyVisible = 50;
+  renderConversation();
+  try {
+    const data = await cmd({ type: 'get_messages' });
+    const messages = (data && data.messages) || [];
+    state.historyMessages = messages;
+    renderHistorySlice();
+  } catch { /* ignore */ }
+  await refreshState();
+  await refreshStats();
+}
+
+function renderHistorySlice() {
+  const messages = state.historyMessages || [];
+  const count = Math.min(state.historyVisible || 50, messages.length);
+  state.items = [];
+  state.toolBlocks.clear();
+  const slice = messages.slice(-count);
+  for (const m of slice) handleMessageStart(m);
+  renderConversation({ noScroll: true });
+}
+
+// ================= token =================
+
+const TOKEN_STORAGE_KEY = 'pi_token';
+
+function getStoredToken() {
+  try { return sessionStorage.getItem(TOKEN_STORAGE_KEY); } catch { return null; }
+}
+
+function setStoredToken(t) {
+  try {
+    if (t) sessionStorage.setItem(TOKEN_STORAGE_KEY, t);
+    else sessionStorage.removeItem(TOKEN_STORAGE_KEY);
+  } catch { /* ignore */ }
+}
+
+function getAccessLink(token) {
+  const t = token || state.token;
+  const origin = window.location.origin;
+  return t ? origin + '/?token=' + encodeURIComponent(t) : origin;
+}
+
+function setAuthenticated(v) {
+  $('#queue').classList.toggle('hidden', !v);
+  $('#composer-wrap').classList.toggle('hidden', !v);
+  $('#statsbar').classList.toggle('hidden', !v);
+}
+
+function showAuthGate(token) {
+  state.authGateToken = token || null;
+  const inner = $('#messages-inner');
+  inner.innerHTML = '';
+  const w = el('div', 'welcome');
+  const card = el('div', 'welcome-card auth-card');
+  const h = el('h1', null, 'π web ui');
+  const p1 = el('p', null, 'This browser does not have a valid access token.');
+  const steps = el('ol', 'auth-steps');
+  const li1 = el('li', null, 'Start the pi web ui server. On startup it prints an access link containing your access token.');
+  const li2 = el('li', null, 'Open that access link in this browser. The access token is stored in browser memory and you are redirected to the top page without the token.');
+  steps.appendChild(li1); steps.appendChild(li2);
+  card.appendChild(h); card.appendChild(p1); card.appendChild(steps);
+  const t = state.authGateToken;
+  if (t) {
+    const p2 = el('p', null, 'To get your access link, open this URL in this browser:');
+    const row = document.createElement('div');
+    row.className = 'auth-link-row';
+    const code = el('code', null, getAccessLink(t));
+    row.appendChild(code);
+    p2.appendChild(row);
+    card.appendChild(p2);
+  }
+  const p3 = el('p', null, 'The access token is valid for 5 minutes and is regenerated automatically. When it is regenerated, the server prints a new access link and pushes the new token to connected browsers over the event stream.');
+  card.appendChild(p3);
+  const copyBtn = document.createElement('button');
+  copyBtn.className = 'auth-copy';
+  copyBtn.textContent = 'Copy access link';
+  copyBtn.addEventListener('click', () => { copyText(getAccessLink(state.authGateToken)).then(() => { copyBtn.textContent = 'Copied!'; setTimeout(() => { copyBtn.textContent = 'Copy access link'; }, 1500); }); });
+  card.appendChild(copyBtn);
+  w.appendChild(card);
+  inner.appendChild(w);
+  setAuthenticated(false);
+}
+
+function handleUnauthorized() {
+  const hadToken = state.token;
+  state.token = null;
+  setStoredToken(null);
+  if (es) { es.close(); es = null; }
+  showAuthGate(hadToken || null);
+}
+
 async function api(path, opts) {
+  opts = opts || {};
+  if (state.token) {
+    opts.headers = Object.assign({}, opts.headers, { Authorization: 'Bearer ' + state.token });
+  }
   const r = await fetch(path, opts);
+  if (r.status === 401) { handleUnauthorized(); }
   const j = await r.json().catch(() => ({}));
   return { ok: r.ok, status: r.status, ...j };
 }
@@ -153,19 +354,64 @@ function toast(msg, type) {
   setTimeout(() => t.remove(), 5000);
 }
 
+async function copyText(t) {
+  const text = t == null ? '' : String(t);
+  try {
+    await navigator.clipboard.writeText(text);
+  } catch {
+    const ta = document.createElement('textarea');
+    ta.value = text;
+    document.body.appendChild(ta);
+    ta.select();
+    document.execCommand('copy');
+    ta.remove();
+  }
+}
+
+function enhanceCodeBlocks(container) {
+  if (!container || !container.querySelectorAll) return;
+  const pres = container.querySelectorAll('pre');
+  pres.forEach(pre => {
+    if (pre.querySelector('.codeblock-header')) return;
+    const code = pre.querySelector('code');
+    const lang = code ? (code.getAttribute('class') || '').replace(/^language-/, '') : '';
+    const header = document.createElement('div');
+    header.className = 'codeblock-header';
+    const langEl = document.createElement('span');
+    langEl.className = 'codeblock-lang';
+    langEl.textContent = lang || 'code';
+    const btn = document.createElement('button');
+    btn.className = 'codeblock-copy';
+    btn.textContent = 'Copy';
+    btn.addEventListener('click', () => {
+      const val = code ? code.textContent : pre.textContent;
+      copyText(val).then(() => { btn.textContent = 'Copied!'; setTimeout(() => { btn.textContent = 'Copy'; }, 1500); });
+    });
+    header.appendChild(langEl);
+    header.appendChild(btn);
+    pre.insertBefore(header, pre.firstChild);
+  });
+}
+
 async function postUiResponse(rec) {
   try { await api('/api/ui-response', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(rec) }); } catch { /* ignore */ }
 }
 
 // ================= sse =================
 
-const es = new EventSource('/api/events');
-es.onmessage = (ev) => {
-  let rec;
-  try { rec = JSON.parse(ev.data); } catch { return; }
-  handleEvent(rec);
-};
-es.onerror = () => { /* EventSource auto-retries */ };
+let es = null;
+
+function connectEvents() {
+  if (es) { es.close(); es = null; }
+  if (!state.token) return;
+  es = new EventSource('/api/events?token=' + encodeURIComponent(state.token));
+  es.onmessage = (ev) => {
+    let rec;
+    try { rec = JSON.parse(ev.data); } catch { return; }
+    handleEvent(rec);
+  };
+  es.onerror = () => { /* EventSource auto-retries */ };
+}
 
 async function refreshState() {
   try {
@@ -174,11 +420,7 @@ async function refreshState() {
       state.streaming = !!data.isStreaming;
       state.model = data.model || null;
       state.thinkingLevel = data.thinkingLevel || null;
-      state.steeringMode = data.steeringMode || 'all';
-      state.followUpMode = data.followUpMode || 'one-at-a-time';
       state.sessionName = data.sessionName || null;
-      state.autoCompactionEnabled = !!data.autoCompactionEnabled;
-      state.compacting = !!data.isCompacting;
       syncControlsNow();
       setStatus(data.isStreaming ? 'streaming' : 'idle', data.isStreaming ? 'pill-streaming' : 'pill-idle');
       $('#btn-abort').classList.toggle('hidden', !data.isStreaming);
@@ -191,6 +433,7 @@ async function refreshStats() {
   try {
     const data = await cmd({ type: 'get_session_stats' });
     if (data) state.stats = data;
+    renderStats();
   } catch { /* ignore */ }
 }
 
@@ -202,13 +445,14 @@ function handleEvent(rec) {
     case 'agent_start':
       state.streaming = true;
       state.streamingItem = null;
+      setStatus('streaming', 'pill-streaming');
+      $('#btn-abort').classList.remove('hidden');
       break;
     case 'agent_end':
       break;
     case 'agent_settled':
       state.streaming = false;
       state.retry = null;
-      state.compacting = false;
       refreshState();
       refreshStats();
       break;
@@ -233,9 +477,6 @@ function handleEvent(rec) {
     case 'tool_execution_end':
       handleToolExecutionEnd(rec);
       break;
-    case 'bash_execution_update':
-      handleBashExecutionUpdate(rec);
-      break;
     case 'queue_update':
       state.queue = { steering: rec.steering || [], followUp: rec.followUp || [] };
       renderQueue();
@@ -247,12 +488,6 @@ function handleEvent(rec) {
     case 'session_info_changed':
       state.sessionName = rec.name !== undefined ? rec.name : null;
       renderSessionName();
-      break;
-    case 'compaction_start':
-      state.compacting = true;
-      break;
-    case 'compaction_end':
-      state.compacting = false;
       break;
     case 'auto_retry_start':
       state.retry = { attempt: rec.attempt, maxAttempts: rec.maxAttempts, errorMessage: rec.errorMessage };
@@ -270,6 +505,16 @@ function handleEvent(rec) {
       break;
     case 'extension_ui_response':
       break;
+    case 'token_rotated': {
+      const newToken = rec.token;
+      if (!newToken) break;
+      state.token = newToken;
+      setStoredToken(newToken);
+      setAuthenticated(true);
+      connectEvents();
+      toast('Access token rotated. New access link: ' + window.location.origin + '/?token=' + newToken);
+      break;
+    }
     default:
       break;
   }
@@ -335,6 +580,7 @@ function handleMessageEnd(msg) {
     if (item.usage) {
       state.stats = Object.assign({}, state.stats || {}, { tokens: item.usage, cost: item.usage.cost, assistantUsage: item.usage });
     }
+    renderStats();
   }
 }
 
@@ -358,11 +604,11 @@ function handleMessageUpdate(rec) {
       break;
     case 'text_delta':
       b.type = 'text'; b.text += ev.delta;
-      if (b.el) b.el.innerHTML = md(b.text);
+      if (b.el) { b.el.innerHTML = md(b.text); enhanceCodeBlocks(b.el); }
       break;
     case 'text_end':
       b.type = 'text'; b.text = ev.content != null ? ev.content : b.text; b.state = 'closed';
-      if (b.el) b.el.innerHTML = md(b.text);
+      if (b.el) { b.el.innerHTML = md(b.text); enhanceCodeBlocks(b.el); }
       break;
     case 'thinking_start':
       b.type = 'thinking'; b.text = ''; b.open = false; b.state = 'open';
@@ -436,11 +682,10 @@ function handleToolExecutionEnd(rec) {
   updateToolCard(b);
 }
 
-function handleBashExecutionUpdate() { /* direct rpc bash streams handled via tool executions */ }
-
 // ================= rendering =================
 
-function renderConversation() {
+function renderConversation(opts) {
+  opts = opts || {};
   const inner = $('#messages-inner');
   inner.innerHTML = '';
   if (!state.items.length) {
@@ -459,7 +704,7 @@ function renderConversation() {
     const e = createItemEl(item);
     if (e) inner.appendChild(e);
   }
-  scrollToBottom();
+  if (!opts || !opts.noScroll) scrollToBottom();
 }
 
 function createItemEl(item) {
@@ -469,6 +714,13 @@ function createItemEl(item) {
     const bubble = el('div', 'user-bubble');
     bubble.innerHTML = md(item.text);
     content.appendChild(bubble);
+    const actions = el('div', 'msg-actions');
+    const copyBtn = document.createElement('button');
+    copyBtn.className = 'msg-action-btn';
+    copyBtn.textContent = 'Copy';
+    copyBtn.addEventListener('click', () => { copyText(item.text).then(() => { copyBtn.textContent = 'Copied!'; setTimeout(() => { copyBtn.textContent = 'Copy'; }, 1500); }); });
+    actions.appendChild(copyBtn);
+    content.appendChild(actions);
     wrap.appendChild(content);
     return wrap;
   }
@@ -491,6 +743,21 @@ function createItemEl(item) {
       errEl.innerHTML = '<strong>Error</strong> ' + esc(item.errorMessage);
       blocksEl.appendChild(errEl);
     }
+    const actions = el('div', 'msg-actions');
+    const copyBtn = document.createElement('button');
+    copyBtn.className = 'msg-action-btn';
+    copyBtn.textContent = 'Copy message';
+    copyBtn.addEventListener('click', () => {
+      let mdText = '';
+      if (item.kind === 'assistant') {
+        const parts = [];
+        for (const b of item.blocks || []) { if (b.type === 'text') parts.push(b.text || ''); }
+        mdText = parts.join('\n\n');
+      }
+      copyText(mdText).then(() => { copyBtn.textContent = 'Copied!'; setTimeout(() => { copyBtn.textContent = 'Copy message'; }, 1500); });
+    });
+    actions.appendChild(copyBtn);
+    content.appendChild(actions);
     return wrap;
   }
   if (item.kind === 'custom' || item.kind === 'summary') {
@@ -509,6 +776,7 @@ function createBlockEl(b) {
   if (b.type === 'text') {
     const d = el('div', 'block-text md');
     d.innerHTML = md(b.text);
+    enhanceCodeBlocks(d);
     b.el = d;
     return d;
   }
@@ -557,7 +825,7 @@ function createBlockEl(b) {
     const cmdWrap = document.createElement('div');
     const cmdPre = document.createElement('pre');
     cmdPre.className = 'bash-command';
-    cmdPre.textContent = (b.arguments && b.arguments.command) || '';
+    cmdPre.innerHTML = highlight((b.arguments && b.arguments.command) || '', 'bash');
     const outWrap = document.createElement('div');
     const outPre = document.createElement('pre');
     outPre.className = 'bash-output';
@@ -606,7 +874,7 @@ function updateToolCard(b) {
   b.statusEl.textContent = b.status === 'running' ? 'running' : b.status;
   b.el.classList.toggle('error', b.status === 'error');
   if (b.type === 'toolCall') {
-    if (b.arguments && b.arguments.command) b.commandEl.textContent = b.arguments.command;
+    if (b.arguments && b.arguments.command) b.commandEl.innerHTML = highlight(b.arguments.command, 'bash');
     b.argsEl.textContent = JSON.stringify(b.arguments || {}, null, 2);
     b.resultEl.textContent = b.resultText || '';
     b.outputEl.textContent = b.output != null ? b.output : (b.resultText || '');
@@ -848,12 +1116,29 @@ function bindControls() {
   $('#thinking-select').addEventListener('change', async () => {
     try { await cmd({ type: 'set_thinking_level', level: $('#thinking-select').value }); } catch { /* ignore */ }
   });
+  $('#btn-sessions').addEventListener('click', async () => {
+    const panel = $('#sessions-panel');
+    if (panel.classList.contains('hidden')) {
+      panel.classList.remove('hidden');
+      await loadSessions();
+    } else {
+      panel.classList.add('hidden');
+    }
+  });
+  $('#sessions-close').addEventListener('click', () => { $('#sessions-panel').classList.add('hidden'); });
 }
 
 const messagesEl = $('#messages');
 messagesEl.addEventListener('scroll', () => {
-  const near = messagesEl.scrollHeight - messagesEl.scrollTop - messagesEl.clientHeight < 90;
-  state.autoScroll = near;
+  const nearBottom = messagesEl.scrollHeight - messagesEl.scrollTop - messagesEl.clientHeight < 90;
+  state.autoScroll = nearBottom;
+  const total = (state.historyMessages || []).length;
+  const visible = state.historyVisible || 50;
+  if (messagesEl.scrollTop <= 60 && visible < total) {
+    state.historyVisible = Math.min(visible * 2, total);
+    renderHistorySlice();
+    messagesEl.scrollTop = 0;
+  }
 });
 
 function scrollToBottom() {
@@ -862,33 +1147,41 @@ function scrollToBottom() {
 }
 
 async function init() {
+  const params = new URLSearchParams(window.location.search);
+  const urlToken = params.get('token');
+  if (urlToken) {
+    // Browser connected via the access link: store the access token in
+    // browser memory and redirect to the URL without token (top page).
+    setStoredToken(urlToken);
+    const clean = (window.location.pathname === '/index.html') ? '/' : window.location.pathname;
+    window.history.replaceState(null, '', clean + window.location.hash);
+  }
+  const stored = getStoredToken();
+  if (stored) state.token = stored;
+  if (!state.token) { showAuthGate(); return; }
+  setAuthenticated(true);
+  await connect();
+}
+
+async function connect() {
+  connectEvents();
   let alive = true;
   try {
     const h = await api('/api/health');
     alive = h.ok;
   } catch { alive = false; }
-  state.agentAlive = alive;
   setStatus(alive ? 'idle' : 'agent offline', alive ? 'pill-idle' : 'pill-error');
   $('#btn-abort').classList.toggle('hidden', !alive);
   await loadModels();
   await loadThinkingLevels();
   bindControls();
+  await loadSessions();
   await refreshState();
   await refreshStats();
 }
 
 document.addEventListener('DOMContentLoaded', async () => {
   await init();
-  setInterval(async () => {
-    try {
-      const data = await cmd({ type: 'get_state' });
-      state.streaming = !!data.isStreaming;
-      setStatus(data.isStreaming ? 'streaming' : 'idle', data.isStreaming ? 'pill-streaming' : 'pill-idle');
-      $('#btn-abort').classList.toggle('hidden', !data.isStreaming);
-      renderStats();
-    } catch { /* ignore */ }
-  }, 3000);
-  setInterval(() => { refreshStats(); }, 5000);
   scrollToBottom();
 });
 

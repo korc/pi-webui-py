@@ -12,7 +12,16 @@ Events (SSE).
 python3 server.py
 ```
 
-Then open <http://localhost:8787> in your browser.
+On startup the server generates an access token and prints it together with an
+access link to the console, e.g.:
+
+```
+[pi-webui] access token: <token>
+[pi-webui] access link: http://localhost:8787/?token=<token>
+```
+
+Open the access link in your browser to connect. The browser stores the access
+token in its own memory and is redirected to the top page (URL without token).
 
 Configuration via environment variables:
 
@@ -20,7 +29,26 @@ Configuration via environment variables:
 |---|---|---|
 | `PI_WEB_HOST` | `0.0.0.0` | Bind address |
 | `PI_WEB_PORT` | `8787` | HTTP port |
-| `PI_WEB_CWD` | `/home/user/aaaa` | Working directory of the pi agent |
+| `PI_WEB_CWD` | *(current directory)* | Working directory of the pi agent |
+| `PI_WEB_TOKEN_TTL` | `300` | Access token lifetime in seconds (token regeneration interval) |
+
+## Access token
+
+- On startup a fresh access token is generated and a link containing it is
+  printed to the server console.
+- When a browser connects via that link, the access token is stored in the
+  browser memory and the user is redirected to the URL without token (the top
+  page).
+- All API requests except `GET /api/health` must be authenticated with the
+  access token (via `Authorization: Bearer <token>`, `X-Api-Key` header or
+  `?token=<token>` query parameter). Static pages (`/`, `/index.html`,
+  `/style.css`, `/app.js`) are served without a token and do not need one.
+- If the browser does not have a valid access token, the UI shows instructions
+  on how to get the access link.
+- The access token is regenerated every 5 minutes (or when used after
+  expiry). When it is regenerated, connected browsers receive the new token via
+  the SSE stream (`token_rotated` event) and the server log displays the new
+  access link.
 
 ## Architecture
 
@@ -38,6 +66,12 @@ Browser (web/)  --HTTP POST /api/command-->  Python server (server.py)  --JSONL 
 - Extension UI dialogs (`select`, `confirm`, `input`, `editor`) requested by pi
   extensions are surfaced in the browser and answered back over
   `/api/ui-response`.
+
+## Authentication
+
+- `GET /api/health` is public (no token required).
+- Every other `/api/*` endpoint requires a valid access token.
+- Static files do not require a token.
 
 ## Frontend features
 

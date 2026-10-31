@@ -4,6 +4,17 @@
 Spawns a `pi --mode rpc` subprocess and exposes it over HTTP + SSE so a
 browser can chat with the pi coding agent.
 
+Access token flow:
+  - On startup a fresh access token is generated and a link containing it is
+    printed to the server console, e.g. http://localhost:8787/?token=<token>.
+  - A browser opens that link; the access token is stored in browser memory and
+    the user is redirected to the top page (URL without token).
+  - All API requests except /api/health must be authenticated with the access
+    token. Static pages are served without a token.
+  - The access token expires (default: 5 minutes) and is regenerated; connected
+    browsers receive the new token via the SSE stream and the server prints the
+    new access link to the log.
+
 Endpoints:
   GET  /api/health      -> {"ok": true, ...}
   GET  /api/events      -> SSE stream of pi session records
@@ -19,19 +30,22 @@ Endpoints:
 import json
 import os
 import queue
+import secrets
+import socket
 import subprocess
 import threading
 import time
 import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import urlparse
+from urllib.parse import urlparse, parse_qs
 
 HOST = os.environ.get("PI_WEB_HOST", "0.0.0.0")
 PORT = int(os.environ.get("PI_WEB_PORT", "8787"))
 STATIC_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "web")
-PI_ARGS = ["pi", "--mode", "rpc", "--no-session"]
-PI_CWD = os.environ.get("PI_WEB_CWD", "/home/user/aaaa")
+PI_ARGS = ["pi", "--mode", "rpc", "--session-dir", os.environ.get("PI_SESSION_DIR", os.path.expanduser("~/.pi/agent/sessions"))]
+PI_CWD = os.environ.get("PI_WEB_CWD") or os.getcwd()
 CMD_TIMEOUT = 300
+TOKEN_TTL_SECONDS = int(os.environ.get("PI_WEB_TOKEN_TTL", "300"))
 
 
 class Bridge:
@@ -43,7 +57,67 @@ class Bridge:
         self.clients = []  # list of queue.Queue
         self.clients_lock = threading.Lock()
         self.stderr_file = None
+        self.session_dir = os.environ.get("PI_SESSION_DIR", os.path.expanduser("~/.pi/agent/sessions"))
+        self.token = secrets.token_urlsafe(32)
+        self.token_created_at = time.monotonic()
+        self.token_link = self._build_token_link()
+        print("[pi-webui] access token: " + self.token, flush=True)
+        print("[pi-webui] access link: " + self.token_link, flush=True)
+        print("[pi-webui] access link (local): " + self._build_token_link("localhost"), flush=True)
         self.start()
+        threading.Thread(target=self._rotate_loop, daemon=True).start()
+
+    def _rotate_loop(self):
+        while True:
+            time.sleep(TOKEN_TTL_SECONDS)
+            self.rotate_token()
+
+    def _outbound_ip(self):
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            s.connect(("8.8.8.8", 80))
+            ip = s.getsockname()[0]
+            s.close()
+            if ip and not ip.startswith("127."):
+                return ip
+        except Exception:
+            pass
+        return None
+
+    def _build_token_link(self, host=None):
+        if not host:
+            host = self._outbound_ip() or ("localhost" if (HOST in ("0.0.0.0", "::", "")) else HOST)
+        return "http://" + host + ":" + str(PORT) + "/?token=" + self.token
+
+    def rotate_token(self):
+        """Regenerate the access token, push it to connected browsers via SSE
+        and print the new access link to the server log."""
+        self.token = secrets.token_urlsafe(32)
+        self.token_created_at = time.monotonic()
+        self.token_link = self._build_token_link()
+        print("[pi-webui] access token rotated: " + self.token, flush=True)
+        print("[pi-webui] access link: " + self.token_link, flush=True)
+        print("[pi-webui] access link (local): " + self._build_token_link("localhost"), flush=True)
+        with self.clients_lock:
+            clients = list(self.clients)
+        for c in clients:
+            try:
+                c.put_nowait({"type": "token_rotated", "token": self.token})
+            except Exception:
+                pass
+
+    def check_token(self, token):
+        """Validate an access token. Regenerates (rotates) it once it has
+        expired; the new token must then be delivered to the browser, which
+        happens automatically via the SSE token_rotated event."""
+        if not token:
+            return False
+        if not secrets.compare_digest(token.encode("utf-8"), self.token.encode("utf-8")):
+            return False
+        if time.monotonic() - self.token_created_at > TOKEN_TTL_SECONDS:
+            self.rotate_token()
+            return False
+        return True
 
     # ---------- process lifecycle ----------
 
@@ -217,19 +291,68 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def _read_body(self):
-        length = int(self.headers.get("Content-Length") or 0)
-        raw = self.rfile.read(length) if length > 0 else b"{}"
+        try:
+            length = int(self.headers.get("Content-Length") or 0)
+        except (ValueError, TypeError):
+            length = 0
+        if length <= 0:
+            return {}
+        if length > 1024 * 1024:
+            return {}
+        raw = self.rfile.read(length)
         return json.loads(raw.decode("utf-8") or "{}")
 
+    def _authorized(self):
+        token = ""
+        auth = self.headers.get("Authorization") or ""
+        if auth.startswith("Bearer "):
+            token = auth[len("Bearer "):]
+        if not token:
+            token = self.headers.get("X-Api-Key") or ""
+        if not token:
+            q = parse_qs(urlparse(self.path).query)
+            token = (q.get("token") or [""])[0]
+        return BRIDGE.check_token(token)
+
     # ---------- routes ----------
+
+    def _serve_static(self, path):
+        if path == "/":
+            path = "/index.html"
+        if path in ("/index.html", "/style.css", "/app.js"):
+            fname = path.lstrip("/")
+            fpath = os.path.join(STATIC_DIR, fname)
+            if not os.path.isfile(fpath):
+                return self._send_json(404, {"ok": False, "error": "not found"})
+            if path == "/index.html":
+                body = open(fpath, "r", encoding="utf-8").read().encode("utf-8")
+                ctype = "text/html; charset=utf-8"
+            elif path == "/style.css":
+                body = open(fpath, "rb").read()
+                ctype = "text/css; charset=utf-8"
+            else:
+                body = open(fpath, "rb").read()
+                ctype = "text/javascript; charset=utf-8"
+            self.send_response(200)
+            self.send_header("Content-Type", ctype)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
+        return self._send_json(404, {"ok": False, "error": "not found"})
 
     def do_GET(self):
         parsed = urlparse(self.path)
         path = parsed.path
+        # static pages do not need a token
+        if path == "/" or path == "/index.html" or path == "/style.css" or path == "/app.js":
+            return self._serve_static(path)
         if path == "/api/health":
             with BRIDGE.cond:
                 running = BRIDGE.proc is not None and BRIDGE.proc.poll() is None
             return self._send_json(200, {"ok": running})
+        if not self._authorized():
+            return self._send_json(401, {"ok": False, "error": "Unauthorized"})
         if path == "/api/events":
             return self._sse()
         if path == "/api/state":
@@ -250,31 +373,46 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send_json(200, {"ok": True, "data": resp.get("data")})
             except Exception as e:
                 return self._send_json(500, {"ok": False, "error": str(e)})
-        # static files
-        if path == "/":
-            path = "/index.html"
-        if path in ("/index.html", "/style.css", "/app.js"):
-            fname = path.lstrip("/")
-            fpath = os.path.join(STATIC_DIR, fname)
-            if not os.path.isfile(fpath):
-                return self._send_json(404, {"ok": False, "error": "not found"})
-            ctype = {
-                "/index.html": "text/html; charset=utf-8",
-                "/style.css": "text/css; charset=utf-8",
-                "/app.js": "text/javascript; charset=utf-8",
-            }[path]
-            body = open(fpath, "rb").read()
-            self.send_response(200)
-            self.send_header("Content-Type", ctype)
-            self.send_header("Content-Length", str(len(body)))
-            self.end_headers()
-            self.wfile.write(body)
-            return
-        return self._send_json(404, {"ok": False, "error": "not found"})
+        if path == "/api/sessions":
+            try:
+                sessions = []
+                base = BRIDGE.session_dir
+                for root, dirs, files in os.walk(base):
+                    for f in sorted(files):
+                        if not f.endswith(".jsonl"):
+                            continue
+                        p = os.path.join(root, f)
+                        try:
+                            st = os.stat(p)
+                            msg_count = 0
+                            try:
+                                with open(p, "r") as f:
+                                    for line in f:
+                                        line = line.strip()
+                                        if not line:
+                                            continue
+                                        try:
+                                            if json.loads(line).get("type") == "message":
+                                                msg_count += 1
+                                        except Exception:
+                                            pass
+                            except Exception:
+                                pass
+                            sessions.append({"path": p, "mtime": st.st_mtime, "size": st.st_size, "dir": os.path.dirname(p), "messages": msg_count})
+                        except Exception:
+                            pass
+                sessions.sort(key=lambda s: s["mtime"], reverse=True)
+                return self._send_json(200, {"ok": True, "data": {"sessions": sessions}})
+            except Exception as e:
+                return self._send_json(500, {"ok": False, "error": str(e)})
+        return self._serve_static(path)
 
     def do_POST(self):
         parsed = urlparse(self.path)
         path = parsed.path
+        if path.startswith("/api/"):
+            if path != "/api/health" and not self._authorized():
+                return self._send_json(401, {"ok": False, "error": "Unauthorized"})
         if path == "/api/command":
             body = self._read_body()
             cmd = body.get("command") if isinstance(body.get("command"), dict) else body
@@ -317,21 +455,6 @@ class Handler(BaseHTTPRequestHandler):
             pass
         finally:
             BRIDGE.unsubscribe(q)
-
-    # ---------- static ----------
-
-    def _serve_file(self, path, ctype):
-        fpath = os.path.join(STATIC_DIR, path.lstrip("/"))
-        if not os.path.isfile(fpath):
-            self._send_json(404, {"ok": False, "error": "not found"})
-            return
-        body = open(fpath, "rb").read()
-        self.send_response(200)
-        self.send_header("Content-Type", ctype)
-        self.send_header("Content-Length", str(len(body)))
-        self.end_headers()
-        self.wfile.write(body)
-
 
 def main():
     server = ThreadingHTTPServer((HOST, PORT), Handler)

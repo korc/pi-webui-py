@@ -25,6 +25,7 @@
         <select id="thinking-select" title="Thinking level">
           <option value="">thinking…</option>
         </select>
+        <button id="btn-sessions" class="icon-btn" title="Sessions">Sessions</button>
         <button id="btn-compact" class="icon-btn" title="Compact context">Compact</button>
         <button id="btn-abort" class="icon-btn danger hidden" title="Abort">Abort</button>
       </div>
@@ -63,6 +64,15 @@
       </div>
       <div id="composer-hint" class="hint">Enter to send · Shift+Enter for newline · pi --mode rpc</div>
     </footer>
+  </div>
+
+  <div id="sessions-panel" class="hidden">
+    <div class="sessions-header">
+      <span>Sessions</span>
+      <button id="sessions-close" class="icon-btn" title="Close">×</button>
+    </div>
+    <div id="session-list"></div>
+    <div id="sessions-empty" class="dim" style="padding:16px;">No sessions found.</div>
   </div>
 
   <div id="dialog-overlay" class="hidden">
